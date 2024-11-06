@@ -1,5 +1,3 @@
-import json
-import os
 import random
 import socket
 import threading
@@ -9,11 +7,8 @@ import bencodepy
 from util import (
     BUFFER_SIZE,
     MAX_RETURN_PEERS,
-    SERVER_HOST,
-    SERVER_PORT,
     MAX_PEERS,
     MessageType,
-    FAKE_FILES_PEERS,
     get_ip_address,
 )
 
@@ -40,7 +35,7 @@ class Tracker:
         # Create a socket
         start_thread = threading.Thread(target=self.handle_start)
         start_thread.start()
-                
+
     def handle_start(self):
         server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         server_socket.bind((self.ip, self.port))
@@ -62,7 +57,7 @@ class Tracker:
             #     continue
             except Exception as e:
                 print(f"An exception occured while handling peer {address}: {e}")
-        
+
         server_socket.close()
 
     def stop(self):
@@ -105,6 +100,7 @@ class Tracker:
                 elif message["id"] == MessageType.GET_PEERS.value:
                     self.handle_get_peers(client_socket, message)
                 elif message["id"] == MessageType.CLOSE.value:
+                    self.handle_close(client_socket, message)
                     client_socket.close()
                     break
             except Exception as e:
@@ -119,7 +115,8 @@ class Tracker:
                 peer_ip = message["peer_ip"]
                 peer_port = message["peer_port"]
                 peer_id = message["peer_id"]
-                content = [peer_id, peer_ip, peer_port, True]
+                completed = True
+                content = [peer_id, peer_ip, peer_port, completed]
                 for peer in self.files_peers[infohash]:
                     if peer[1] == peer_ip and peer[2] == peer_port:
                         peer[3] = 1
@@ -140,20 +137,36 @@ class Tracker:
                     self.send_message(client_socket, MessageType.GET_PEERS)
                     return
                 peers = []
-                completed_peers = [peer for peer in self.files_peers[infohash] if peer[3] == True]
+                completed_peers = [
+                    peer for peer in self.files_peers[infohash] if peer[3] == True
+                ]
                 if len(completed_peers) < MAX_RETURN_PEERS:
-                    incompleted_peers = [peer for peer in self.files_peers[infohash] if peer[3] == False]
+                    incompleted_peers = [
+                        peer for peer in self.files_peers[infohash] if peer[3] == False
+                    ]
                     remaining_peers = MAX_RETURN_PEERS - len(completed_peers)
-                    peers = completed_peers + random.choices(incompleted_peers, k=min(remaining_peers, len(incompleted_peers)))
+                    peers = completed_peers + random.choices(
+                        incompleted_peers,
+                        k=min(remaining_peers, len(incompleted_peers)),
+                    )
                 else:
                     peers = random.choice(completed_peers, k=MAX_RETURN_PEERS)
-                if (len(peers) == 0):
+                if len(peers) == 0:
                     self.send_message(client_socket, MessageType.FAILED)
                     return
                 self.send_message(client_socket, MessageType.GET_PEERS, peers=peers)
             except Exception as e:
                 print(f"An exception occured while handling get_peers command: {e}")
                 return
+            
+    def handle_close(self, client_socket, message):
+        for infohash in self.files_peers:
+            for peer in self.files_peers[infohash]:
+                if peer[1] == message["peer_ip"] and peer[2] == message["peer_port"]:
+                    self.files_peers[infohash].remove(peer)
+                    break
+        print(f"Current files_peers: {self.files_peers}")
+        client_socket.close()
 
 
 if __name__ == "__main__":

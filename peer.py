@@ -1,18 +1,22 @@
-import hashlib
-import math
 import os
 import random
-import sys
 import socket
-import string
 import threading
-import time
 from urllib.parse import urlencode
 
 
 import bencodepy
 from torf import Torrent
-from util import BLOCK_SIZE, BUFFER_SIZE, PEER_ID, LOG, MessageType, create_torrent_file, get_ip_address
+from util import (
+    BLOCK_SIZE,
+    BUFFER_SIZE,
+    PIECE_SIZE,
+    MessageType,
+    create_torrent_file,
+    find_file_and_offset,
+    get_ip_address,
+    zip_folder_with_name,
+)
 
 bc = bencodepy.Bencode(encoding="utf-8")
 
@@ -35,7 +39,7 @@ class Peer:
 
         self.peer_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self.peer_socket.bind((self.ip, self.peer_port))
-        
+
         self.files = {}
 
     @property
@@ -44,15 +48,13 @@ class Peer:
         os.makedirs(file_path, exist_ok=True)
         file_path += "/"
         return file_path
-    
+
     def init_folder(self):
         file_path = self.file_path
         for file in os.listdir(file_path):
+            if file.endswith(".torrent"):
+                continue
             path = os.path.join(file_path, file)
-            
-            if os.path.isfile(path) and path.endswith('.torrent'):
-                os.remove(file_path)
-                
             tracker_url = f"http://{self.server_ip}:{self.server_port}/announce"
             torrent_file = create_torrent_file(path, tracker_url, file_path)
             torrent = Torrent.read(torrent_file)
@@ -61,7 +63,7 @@ class Peer:
                 "torrent": torrent,
                 "pieces": [True for _ in range(torrent.pieces)],
             }
-            
+
     def start(self):
         self.running = True
         self.init_folder()
@@ -71,7 +73,11 @@ class Peer:
         peer_thread.start()
 
     def stop(self):
-        message = {"id": MessageType.CLOSE.value}
+        message = {
+            "id": MessageType.CLOSE.value,
+            "peer_ip": self.ip,
+            "peer_port": self.peer_port,
+        }
         self.send_message(self.server_socket, message)
         self.running = False
         self.server_socket.close()
@@ -84,11 +90,11 @@ class Peer:
     def send_message(self, sock, message):
         bencoded_message = bc.encode(message)
         sock.send(bencoded_message)
-        
+
     def send_block(self, sock, message):
         bencoded_message = bencodepy.encode(message)
         sock.send(bencoded_message)
-        
+
     def parse_block(self, message):
         return bencodepy.decode(message)
 
@@ -135,7 +141,7 @@ class Peer:
             return
         print(f"Received response from server: {decoded_response}")
         return decoded_response["payload"]
-    
+
     def listen_peer(self):
         self.peer_socket.listen(10)
         print(f"Start listening for peers on {self.ip}:{self.peer_port}")
@@ -169,7 +175,7 @@ class Peer:
                 message = self.parse_message(message)
             except Exception as e:
                 print(f"An error occured while parsing a message from peer: {e}")
-                
+
             if message["id"] == MessageType.CLOSE.value:
                 break
             elif message["id"] == MessageType.HANDSHAKE.value:
@@ -181,11 +187,12 @@ class Peer:
                 piece_idx = message["piece_index"]
                 block_begin = message["block_begin"]
                 block_length = message["block_length"]
-                self.handle_download_piece(peer_conn, infohash, piece_idx, block_begin, block_length)
-                    
-        
+                self.handle_download_piece(
+                    peer_conn, infohash, piece_idx, block_begin, block_length
+                )
+
         peer_conn.close()
-    
+
     def handle_handshake(self, peer_conn, handshake_res):
         print("Handling handshake from peer")
         # print(f"Received handshake from peer: {handshake_res}")
@@ -204,7 +211,7 @@ class Peer:
                 "payload": self.files[infohash]["pieces"],
             }
         self.send_message(peer_conn, bitfield_res)
-        
+
     def handle_interested(self, peer_conn):
         print("Handling interested from peer")
         unchoke_res = {
@@ -212,32 +219,62 @@ class Peer:
             "payload": "Unchoke successful",
         }
         self.send_message(peer_conn, unchoke_res)
-
-    def handle_download_piece(self, peer_conn, infohash, piece_idx, block_begin, block_length):
+    
+    def handle_download_piece(
+        self, peer_conn, infohash, piece_idx, block_begin, block_length
+    ):
         print("Handling download piece from peer")
         try:
             file_path = self.files[infohash]["path"]
             torrent = self.files[infohash]["torrent"]
             offset = piece_idx * torrent.metainfo["info"]["piece length"] + block_begin
-            with open(file_path, "r+b") as file:
-                file.seek(offset)
-                payload = file.read(block_length)
+            if "files" in torrent.metainfo["info"]:
+                files = []
+                for file in torrent.metainfo["info"]["files"]:
+                    files.append({
+                        "length": file["length"], 
+                        "path": os.path.join(file_path, *file["path"])
+                    })
+                piece_offset = piece_idx * PIECE_SIZE + block_begin
+                file_index, offset = find_file_and_offset(files, piece_offset)
+                if file_index is None:
+                    return None
+                
+                block_data = b""
+                while len(block_data) < block_length and file_index < len(files):
+                    file = files[file_index]
+                    with open(file["path"], "rb") as f:
+                        f.seek(offset)
+                        block_data += f.read(min(block_length - len(block_data), file["length"] - offset))
+                    offset = 0
+                    file_index += 1
                 response_res = {
                     "id": MessageType.RESPONSE.value,
-                    "payload": payload, 
+                    "payload": block_data,
                 }
-                self.send_block(peer_conn, response_res)  
+                self.send_block(peer_conn, response_res)
+                return
+            else:
+                with open(file_path, "rb") as file:
+                    file.seek(offset)
+                    payload = file.read(block_length)
+                    response_res = {
+                        "id": MessageType.RESPONSE.value,
+                        "payload": payload,
+                    }
+                    self.send_block(peer_conn, response_res)
         except Exception as e:
             print(f"An error occured while handling download piece: {e}")
             return
 
     def download(self, filename):
         peers = self.get_peers(filename)
+        if not peers:
+            return
         torrent = Torrent.read(filename)
         total_pieces = torrent.pieces
         print(f"Total pieces: {total_pieces}")
         pieces_count = [{} for _ in range(total_pieces)]
-        print(f"Pieces count: {pieces_count}")
         for peer in peers:
             peer_ip = peer[1]
             peer_port = peer[2]
@@ -248,41 +285,93 @@ class Peer:
                 piece = pieces_of_peer[i]
                 if piece == False:
                     continue
-                
+
                 pieces_count[i] = {
                     "count": pieces_count[i].get("count", 0) + 1,
                     "piece_idx": i,
-                    "peer": [] if "peer" not in pieces_count[i] else pieces_count[i]["peer"],
+                    "peer": (
+                        [] if "peer" not in pieces_count[i] else pieces_count[i]["peer"]
+                    ),
                 }
                 pieces_count[i]["peer"].append((peer_ip, peer_port))
 
-        print(f"Pieces count: {pieces_count}")
-        
         pieces_count = sorted(pieces_count, key=lambda x: x.get("count", 0))
-        
+        self.files[torrent.infohash] = {
+            "path": self.file_path + torrent.metainfo["info"]["name"],
+            "torrent": torrent,
+            "pieces": [False for _ in range(total_pieces)],
+        }
         pieces_of_file = []
-        for piece in pieces_count:
-            if piece["count"] == 0:
-                continue
-            # TODO: Handle case where this peer has stopped, we must pick the next peer if available
-            peer_ip, peer_port = piece["peer"][0]
-            
-            # TODO: Change to thread to download multiple pieces simultaneously, use mutex lock
-            pieces_of_file.append(self.download_piece(peer_ip, peer_port, torrent, piece["piece_idx"]))
         
-        sorted_pieces = sorted(pieces_of_file)
-        folder_path = self.file_path
-        path = folder_path + torrent.metainfo["info"]["name"]
+        def threaded_download_piece(piece, infohash, pieces_of_file):
+            if piece["count"] == 0:
+                return
+            
+            for i in range(len(piece["peer"])):
+                if self.files[infohash]["pieces"][piece["piece_idx"]]:
+                    break
+                peer_ip, peer_port = piece["peer"][i]
+
+                f = self.download_piece(peer_ip, peer_port, torrent, piece["piece_idx"])
+                if not f:
+                    continue
+                with self.lock:
+                    pieces_of_file.append(f)
+                    self.files[infohash]["pieces"][piece["piece_idx"]] = True
+        
+        threads = []     
+        for piece in pieces_count:
+            thread = threading.Thread(target=threaded_download_piece, args=(piece, torrent.infohash, pieces_of_file))
+            threads.append(thread)
+            thread.start()
+        
+        for thread in threads:
+            thread.join()
+
         if len(pieces_of_file) < total_pieces:
             print("Download did not complete")
             return
-        with open(path, 'wb') as outfile:
-            for piece in sorted_pieces:
-                with open(piece, 'rb') as infile:
-                    outfile.write(infile.read())
-        print(f"Downloaded {filename} successfully")
         
-            
+        sorted_pieces = sorted(pieces_of_file)
+        
+        if "files" in torrent.metainfo["info"]:
+            files = []
+            for file in torrent.metainfo["info"]["files"]:
+                files.append({
+                    "length": file["length"], 
+                    "path": os.path.join(self.file_path + torrent.metainfo["info"]["name"], *file["path"])
+                })
+            folder_path = self.file_path
+            index, buffer = 0, b""
+            for file in files:
+                
+                file_length, file_path = file["length"], file["path"]
+                if not os.path.exists(os.path.dirname(file_path)):
+                    os.makedirs(os.path.dirname(file_path))
+                while len(buffer) < file_length:
+                    piece_path = sorted_pieces[index]
+                    with open(piece_path, "rb") as piece_file:
+                        data = piece_file.read()
+                        buffer += data
+                    os.remove(piece_path)
+                    index += 1
+                with open(file_path, "ab") as f:
+                    f.write(buffer[:file_length])
+
+                # Update the buffer to contain the remainder
+                buffer = buffer[file_length:]
+            print(f"Downloaded {filename} successfully")
+        else:
+            folder_path = self.file_path
+            path = folder_path + torrent.metainfo["info"]["name"]
+            with open(path, "wb") as outfile:
+                for piece in sorted_pieces:
+                    with open(piece, "rb") as infile:
+                        outfile.write(infile.read())
+                    os.remove(piece)
+            print(f"Downloaded {filename} successfully")
+            self.upload(filename)
+
     def get_pieces(self, peer_ip, peer_port, torrent: Torrent):
         try:
             peer_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -290,9 +379,9 @@ class Peer:
         except Exception as e:
             print(f"An error occured while trying to connect to the peer: {e}")
             return
-        
+
         self.handshake(torrent, peer_socket)
-    
+
         try:
             bitfield_res = peer_socket.recv(BUFFER_SIZE)
             bitfield_res = self.parse_message(bitfield_res)
@@ -306,7 +395,7 @@ class Peer:
             print(f"An error occured while trying to receive bitfield from peer: {e}")
             peer_socket.close()
             return
-    
+
     def download_piece(self, peer_ip, peer_port, torrent: Torrent, piece_idx):
         try:
             peer_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -314,29 +403,43 @@ class Peer:
         except Exception as e:
             print(f"An error occured while trying to connect to the peer: {e}")
             return
-        
+
         try:
             interested_message = {
                 "id": MessageType.INTERESTED.value,
             }
             self.send_message(peer_socket, interested_message)
-            
+
             unchoke_res = peer_socket.recv(BUFFER_SIZE)
             unchoke_res = self.parse_message(unchoke_res)
             assert unchoke_res["id"] == MessageType.UNCHOKE.value
         except Exception as e:
-            print(f"An error occured while trying to receive interested unchoke from peer: {e}")
+            print(
+                f"An error occured while trying to receive interested unchoke from peer: {e}"
+            )
             peer_socket.close()
             return
-        
+
         try:
             total_pieces = torrent.pieces
-            piece_size = torrent.metainfo["info"]["piece length"] \
-                        if piece_idx < total_pieces - 1 \
-                        else torrent.metainfo["info"]["length"] % torrent.metainfo["info"]["piece length"]
+            piece_size = 0
+            
+            if piece_idx < total_pieces - 1:
+                piece_size = torrent.metainfo["info"]["piece length"]
+            elif "length" in torrent.metainfo["info"]:
+                piece_size = torrent.metainfo["info"]["length"] % torrent.metainfo["info"]["piece length"]
+            else:
+                total_length = sum([file["length"] for file in torrent.metainfo["info"]["files"]])
+                piece_size = total_length % torrent.metainfo["info"]["piece length"]   
+                
             total_blocks = piece_size // BLOCK_SIZE
             folder_path = self.file_path
-            file_path = folder_path + torrent.metainfo["info"]["name"] + ".piece" + str(piece_idx)
+            file_path = (
+                folder_path
+                + torrent.metainfo["info"]["name"]
+                + ".piece"
+                + str(piece_idx)
+            )
             output_file = open(file_path, "wb")
             for block_idx in range(total_blocks):
                 request_message = {
@@ -347,14 +450,16 @@ class Peer:
                     "block_length": BLOCK_SIZE,
                 }
                 self.send_message(peer_socket, request_message)
-                
+
                 try:
                     request_res = peer_socket.recv(BLOCK_SIZE * 2)
                     request_res = self.parse_block(request_res)
                     assert request_res[b"id"] == MessageType.RESPONSE.value
                     output_file.write(request_res[b"payload"])
                 except Exception as e:
-                    print(f"An error occured while trying to receive block {block_idx * BLOCK_SIZE} from peer: {e}")
+                    print(
+                        f"An error occured while trying to receive block {block_idx * BLOCK_SIZE} from peer: {e}"
+                    )
                     peer_socket.close()
                     return
             last_block_size = piece_size % BLOCK_SIZE
@@ -367,27 +472,29 @@ class Peer:
                     "block_length": last_block_size,
                 }
                 self.send_message(peer_socket, request_message)
-                
+
                 try:
                     request_res = peer_socket.recv(BLOCK_SIZE * 2)
                     request_res = self.parse_block(request_res)
                     assert request_res[b"id"] == MessageType.RESPONSE.value
                     output_file.write(request_res[b"payload"])
                 except Exception as e:
-                    print(f"An error occured while trying to receive the last block from peer: {e}")
+                    print(
+                        f"An error occured while trying to receive the last block from peer: {e}"
+                    )
                     peer_socket.close()
                     return
-                
+
             output_file.close()
             print(f"Downloaded piece {piece_idx} from peer {peer_ip}:{peer_port}")
             return file_path
         except Exception as e:
-            print(f"An error occured while trying to download piece {piece_idx} from peer: {e}")
+            print(
+                f"An error occured while trying to download piece {piece_idx} from peer: {e}"
+            )
             peer_socket.close()
             return
-                    
-        
-    
+
     def handshake(self, torrent: Torrent, peer_socket):
         pstrlen = "19"
         pstr = "BitTorrent protocol"
@@ -400,19 +507,18 @@ class Peer:
             "payload": handshake,
         }
         self.send_message(peer_socket, message)
-        
 
 
 def main():
     id = "-PC000" + input("Enter the peer id: ") + "-"
     peer_port = random.randint(10000, 20000)
     peer_ip = get_ip_address()
-    server_ip = "192.168.137.13"
+    server_ip = "10.0.115.64"
     server_port = 22396
     peer = Peer(id, peer_ip, peer_port, server_ip, server_port)
 
     peer.start()
-    
+
     threads = []
     while True:
         command = input("Enter a command: ")
@@ -444,7 +550,10 @@ def main():
             if not filename.endswith(".torrent"):
                 print("Must be a .torrent file")
                 continue
-            download_piece_thread = threading.Thread(target=peer.download_piece, args=(peer_ip, peer_port, torrent, piece_idx))
+            download_piece_thread = threading.Thread(
+                target=peer.download_piece,
+                args=(peer_ip, peer_port, torrent, piece_idx),
+            )
             threads.append(download_piece_thread)
             download_piece_thread.start()
         elif command == "download":
@@ -458,18 +567,14 @@ def main():
 
 
 def test():
-    torrent = Torrent.read("sample.torrent")
-    messsage = {
-        "id": MessageType.UPLOAD.value,
-        "infohash": torrent.infohash,
-    }
-    info_hash =  hashlib.sha1(bencodepy.encode(torrent.metainfo["info"])).digest()
-    pstrlen = "19"
-    pstr = "BitTorrent protocol"
-    reserved = "0" * 8
-    infohash = torrent.infohash
-    print(info_hash)
-    print(len(info_hash))
-    peer_id = PEER_ID
+    torrent = Torrent.read("multi.torrent")
+    files = []
+    for path in torrent.metainfo["info"]["files"]:
+        files.append({
+            "length": path["length"], 
+            "path": os.path.join("files", *path["path"])
+        })
+    print(torrent.metainfo["info"]["files"])
+
 
 main()
