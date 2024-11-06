@@ -1,8 +1,10 @@
 import os
 import random
 import socket
+import sys
 import threading
-from urllib.parse import urlencode
+import time
+from tqdm import tqdm
 
 
 import bencodepy
@@ -15,7 +17,6 @@ from util import (
     create_torrent_file,
     find_file_and_offset,
     get_ip_address,
-    zip_folder_with_name,
 )
 
 bc = bencodepy.Bencode(encoding="utf-8")
@@ -121,8 +122,13 @@ class Peer:
         }
 
         self.send_message(self.server_socket, message)
+        with tqdm(total=100, desc="Uploading", unit="%", unit_scale=True) as progress:
+            for _ in range(100):
+                time.sleep(0.01)  # Adjust sleep time as needed
+                progress.update(1)
         response = self.server_socket.recv(BUFFER_SIZE)
-        print(f"Received response from server: {bc.decode(response)}")
+        response = self.parse_message(response)
+        print(f"Received response from server: {response["payload"]}")
 
     def get_peers(self, filename):
         torrent = Torrent.read(filename)
@@ -219,7 +225,7 @@ class Peer:
             "payload": "Unchoke successful",
         }
         self.send_message(peer_conn, unchoke_res)
-    
+
     def handle_download_piece(
         self, peer_conn, infohash, piece_idx, block_begin, block_length
     ):
@@ -231,21 +237,25 @@ class Peer:
             if "files" in torrent.metainfo["info"]:
                 files = []
                 for file in torrent.metainfo["info"]["files"]:
-                    files.append({
-                        "length": file["length"], 
-                        "path": os.path.join(file_path, *file["path"])
-                    })
+                    files.append(
+                        {
+                            "length": file["length"],
+                            "path": os.path.join(file_path, *file["path"]),
+                        }
+                    )
                 piece_offset = piece_idx * PIECE_SIZE + block_begin
                 file_index, offset = find_file_and_offset(files, piece_offset)
                 if file_index is None:
                     return None
-                
+
                 block_data = b""
                 while len(block_data) < block_length and file_index < len(files):
                     file = files[file_index]
                     with open(file["path"], "rb") as f:
                         f.seek(offset)
-                        block_data += f.read(min(block_length - len(block_data), file["length"] - offset))
+                        block_data += f.read(
+                            min(block_length - len(block_data), file["length"] - offset)
+                        )
                     offset = 0
                     file_index += 1
                 response_res = {
@@ -273,15 +283,15 @@ class Peer:
             return
         torrent = Torrent.read(filename)
         total_pieces = torrent.pieces
-        print(f"Total pieces: {total_pieces}")
+        # print(f"Total pieces: {total_pieces}")
         pieces_count = [{} for _ in range(total_pieces)]
-        for peer in peers:
+        for peer in tqdm(peers, desc="Getting peers from tracker"):
             peer_ip = peer[1]
             peer_port = peer[2]
             pieces_of_peer = self.get_pieces(peer_ip, peer_port, torrent)
-            print(f"Peer {peer_ip}:{peer_port} has pieces: {pieces_of_peer}")
-            for i in range(total_pieces):
-                print(f"Checking piece {i}")
+            # print(f"Peer {peer_ip}:{peer_port} has pieces: {pieces_of_peer}")
+            for i in tqdm(range(total_pieces), desc=f"Checking pieces"):
+                # print(f"Checking piece {i}")
                 piece = pieces_of_peer[i]
                 if piece == False:
                     continue
@@ -302,12 +312,15 @@ class Peer:
             "pieces": [False for _ in range(total_pieces)],
         }
         pieces_of_file = []
-        
+
         def threaded_download_piece(piece, infohash, pieces_of_file):
             if piece["count"] == 0:
                 return
-            
-            for i in range(len(piece["peer"])):
+
+            for i in tqdm(
+                range(len(piece["peer"])),
+                desc=f"Downloading piece {piece['piece_idx']}",
+            ):
                 if self.files[infohash]["pieces"][piece["piece_idx"]]:
                     break
                 peer_ip, peer_port = piece["peer"][i]
@@ -318,33 +331,40 @@ class Peer:
                 with self.lock:
                     pieces_of_file.append(f)
                     self.files[infohash]["pieces"][piece["piece_idx"]] = True
-        
-        threads = []     
+
+        threads = []
         for piece in pieces_count:
-            thread = threading.Thread(target=threaded_download_piece, args=(piece, torrent.infohash, pieces_of_file))
+            thread = threading.Thread(
+                target=threaded_download_piece,
+                args=(piece, torrent.infohash, pieces_of_file),
+            )
             threads.append(thread)
             thread.start()
-        
+
         for thread in threads:
             thread.join()
 
         if len(pieces_of_file) < total_pieces:
             print("Download did not complete")
             return
-        
+
         sorted_pieces = sorted(pieces_of_file)
-        
+
         if "files" in torrent.metainfo["info"]:
             files = []
             for file in torrent.metainfo["info"]["files"]:
-                files.append({
-                    "length": file["length"], 
-                    "path": os.path.join(self.file_path + torrent.metainfo["info"]["name"], *file["path"])
-                })
+                files.append(
+                    {
+                        "length": file["length"],
+                        "path": os.path.join(
+                            self.file_path + torrent.metainfo["info"]["name"],
+                            *file["path"],
+                        ),
+                    }
+                )
             folder_path = self.file_path
             index, buffer = 0, b""
-            for file in files:
-                
+            for file in tqdm(files, desc="Resembling pieces to files"):
                 file_length, file_path = file["length"], file["path"]
                 if not os.path.exists(os.path.dirname(file_path)):
                     os.makedirs(os.path.dirname(file_path))
@@ -361,11 +381,12 @@ class Peer:
                 # Update the buffer to contain the remainder
                 buffer = buffer[file_length:]
             print(f"Downloaded {filename} successfully")
+            self.upload(filename)
         else:
             folder_path = self.file_path
             path = folder_path + torrent.metainfo["info"]["name"]
             with open(path, "wb") as outfile:
-                for piece in sorted_pieces:
+                for piece in tqdm(sorted_pieces, desc="Resembling pieces to file"):
                     with open(piece, "rb") as infile:
                         outfile.write(infile.read())
                     os.remove(piece)
@@ -423,15 +444,20 @@ class Peer:
         try:
             total_pieces = torrent.pieces
             piece_size = 0
-            
+
             if piece_idx < total_pieces - 1:
                 piece_size = torrent.metainfo["info"]["piece length"]
             elif "length" in torrent.metainfo["info"]:
-                piece_size = torrent.metainfo["info"]["length"] % torrent.metainfo["info"]["piece length"]
+                piece_size = (
+                    torrent.metainfo["info"]["length"]
+                    % torrent.metainfo["info"]["piece length"]
+                )
             else:
-                total_length = sum([file["length"] for file in torrent.metainfo["info"]["files"]])
-                piece_size = total_length % torrent.metainfo["info"]["piece length"]   
-                
+                total_length = sum(
+                    [file["length"] for file in torrent.metainfo["info"]["files"]]
+                )
+                piece_size = total_length % torrent.metainfo["info"]["piece length"]
+
             total_blocks = piece_size // BLOCK_SIZE
             folder_path = self.file_path
             file_path = (
@@ -486,7 +512,7 @@ class Peer:
                     return
 
             output_file.close()
-            print(f"Downloaded piece {piece_idx} from peer {peer_ip}:{peer_port}")
+            # print(f"Downloaded piece {piece_idx} from peer {peer_ip}:{peer_port}")
             return file_path
         except Exception as e:
             print(
@@ -520,61 +546,73 @@ def main():
     peer.start()
 
     threads = []
+    
+    print(
+        f"Command options:\n"
+        f"stop - stop the peer\n"
+        f"upload <filename>\n"
+        f"peers <filename>\n"
+        f"download_piece <filename> <peer_ip> <peer_port> <piece_idx>\n"
+        f"download <filename>\n"
+    )
+    
     while True:
-        command = input("Enter a command: ")
-        if command == "stop":
-            peer.stop()
-            break
-        elif command == "upload":
-            filename = input("Enter the filename: ")
-            if not filename.endswith(".torrent"):
-                print("Must be a .torrent file")
+        time.sleep(0.05)
+        command = input()
+        
+        args = command.split()
+        action = args[0]
+        try: 
+            if action == "stop":
+                peer.stop()
+                break
+            elif action == "upload":
+                filename = args[1]
+                if not filename.endswith(".torrent"):
+                    print("Must be a .torrent file")
+                    continue
+                upload_thread = threading.Thread(target=peer.upload, args=(filename,))
+                threads.append(upload_thread)
+                upload_thread.start()
+            elif action == "peers":
+                filename = args[1]
+                if not filename.endswith(".torrent"):
+                    print("Must be a .torrent file")
+                    continue
+                get_peer_thread = threading.Thread(target=peer.get_peers, args=(filename,))
+                threads.append(get_peer_thread)
+                get_peer_thread.start()
+            elif action == "download_piece":
+                filename = args[1]
+                peer_ip = args[2]
+                peer_port = int(args[3])
+                torrent = Torrent.read(filename)
+                piece_idx = int(args[4])
+                if not filename.endswith(".torrent"):
+                    print("Must be a .torrent file")
+                    continue
+                download_piece_thread = threading.Thread(
+                    target=peer.download_piece,
+                    args=(peer_ip, peer_port, torrent, piece_idx),
+                )
+                threads.append(download_piece_thread)
+                download_piece_thread.start()
+            elif action == "download":
+                filename = args[1]
+                if not filename.endswith(".torrent"):
+                    print("Must be a .torrent file")
+                    continue
+                download_thread = threading.Thread(target=peer.download, args=(filename,))
+                threads.append(download_thread)
+                download_thread.start()
+            else:
+                print("Invalid command")
                 continue
-            upload_thread = threading.Thread(target=peer.upload, args=(filename,))
-            threads.append(upload_thread)
-            upload_thread.start()
-        elif command == "peers":
-            filename = input("Enter the filename: ")
-            if not filename.endswith(".torrent"):
-                print("Must be a .torrent file")
-                continue
-            get_peer_thread = threading.Thread(target=peer.get_peers, args=(filename,))
-            threads.append(get_peer_thread)
-            get_peer_thread.start()
-        elif command == "download_piece":
-            filename = input("Enter the filename: ")
-            peer_ip = input("Enter the peer ip: ")
-            peer_port = int(input("Enter the peer port: "))
-            torrent = Torrent.read(filename)
-            piece_idx = int(input("Enter the piece index: "))
-            if not filename.endswith(".torrent"):
-                print("Must be a .torrent file")
-                continue
-            download_piece_thread = threading.Thread(
-                target=peer.download_piece,
-                args=(peer_ip, peer_port, torrent, piece_idx),
-            )
-            threads.append(download_piece_thread)
-            download_piece_thread.start()
-        elif command == "download":
-            filename = input("Enter the filename: ")
-            if not filename.endswith(".torrent"):
-                print("Must be a .torrent file")
-                continue
-            download_thread = threading.Thread(target=peer.download, args=(filename,))
-            threads.append(download_thread)
-            download_thread.start()
-
-
-def test():
-    torrent = Torrent.read("multi.torrent")
-    files = []
-    for path in torrent.metainfo["info"]["files"]:
-        files.append({
-            "length": path["length"], 
-            "path": os.path.join("files", *path["path"])
-        })
-    print(torrent.metainfo["info"]["files"])
-
+        except Exception as e:
+            print(f"An error occured while executing the command: {e}")
+            continue
+    
+    for thread in threads:
+        thread.join()
 
 main()
