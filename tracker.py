@@ -26,10 +26,10 @@ class Tracker:
 
         self.files_peers = (
             {}
-        )  # A dictionary of files and their list of peers having that file
+        )
         self.lock = (
             threading.Lock()
-        )  # A lock to control access to the files_peers dictionary
+        )
 
     def start(self):
         # Create a socket
@@ -105,6 +105,7 @@ class Tracker:
                     break
             except Exception as e:
                 print(f"An exception occured while handling client: {e}")
+                break
 
     def handle_upload(self, client_socket, message):
         with self.lock:
@@ -177,7 +178,7 @@ if __name__ == "__main__":
 
     server.start()
     while True:
-        command = input("Enter a command: ")
+        command = input()
         if command == "stop":
             server.stop()
             break

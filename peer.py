@@ -124,7 +124,7 @@ class Peer:
         self.send_message(self.server_socket, message)
         with tqdm(total=100, desc="Uploading", unit="%", unit_scale=True) as progress:
             for _ in range(100):
-                time.sleep(0.01)  # Adjust sleep time as needed
+                time.sleep(0.01)
                 progress.update(1)
         response = self.server_socket.recv(BUFFER_SIZE)
         response = self.parse_message(response)
@@ -142,7 +142,7 @@ class Peer:
         self.send_message(self.server_socket, message)
         with tqdm(total=100, desc="Getting peers from tracker", unit="%", unit_scale=True) as progress:
             for _ in range(100):
-                time.sleep(0.01)  # Adjust sleep time as needed
+                time.sleep(0.01)
                 progress.update(1)
         response = self.server_socket.recv(BUFFER_SIZE)
         decoded_response = self.parse_message(response)
